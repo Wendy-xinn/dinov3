@@ -71,7 +71,7 @@ setup(
         "dev": dev_requirements,
     },
     install_package_data=True,
-    license="DINOv3 LIcense",
+    license="DINOv3 License",
     license_files=("LICENSE.md",),
     classifiers=[
         # Trove classifiers: https://github.com/pypa/trove-classifiers/blob/main/src/trove_classifiers/__init__.py
