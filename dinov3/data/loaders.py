@@ -43,6 +43,13 @@ def _make_sample_transform(
     return transform
 
 
+DATASET_CATALOG = {
+    "ImageNet": ImageNet,
+    "ImageNet22k": ImageNet22k,
+    "ADE20K": ADE20K,
+    "CocoCaptions": CocoCaptions,
+}
+
 def _parse_dataset_str(dataset_str: str):
     tokens = dataset_str.split(":")
 
@@ -54,22 +61,20 @@ def _parse_dataset_str(dataset_str: str):
         assert key in ("root", "extra", "split")
         kwargs[key] = value
 
+    if name not in DATASET_CATALOG:
+        raise ValueError(f'Unsupported dataset "{name}"')
+
+    class_ = DATASET_CATALOG[name]
+
     if name == "ImageNet":
-        class_ = ImageNet
         if "split" in kwargs:
             kwargs["split"] = ImageNet.Split[kwargs["split"]]
-    elif name == "ImageNet22k":
-        class_ = ImageNet22k
     elif name == "ADE20K":
-        class_ = ADE20K
         if "split" in kwargs:
             kwargs["split"] = ADE20K.Split[kwargs["split"]]
     elif name == "CocoCaptions":
-        class_ = CocoCaptions
         if "split" in kwargs:
             kwargs["split"] = CocoCaptions.Split[kwargs["split"]]
-    else:
-        raise ValueError(f'Unsupported dataset "{name}"')
 
     return class_, kwargs
 
