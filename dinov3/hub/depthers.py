@@ -8,8 +8,6 @@ from typing import Optional, Tuple
 
 import torch
 from dinov3.eval.dense.depth.models import build_depther
-from urllib.parse import urlparse
-from pathlib import Path
 
 from .utils import DINOV3_BASE_URL
 from .backbones import (
