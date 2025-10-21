@@ -145,7 +145,7 @@ def ac_compile_parallelize(
             for prev_block, next_block in zip(blocks, blocks[1:]):
                 prev_block.set_modules_to_forward_prefetch([next_block])
                 next_block.set_modules_to_backward_prefetch([prev_block])
-            fully_shard(m.backbone, **fsdp_config, reshard_after_forward=True).set_reduce_scatter_divide_factor(1)
+            fully_shard(m.backbone, **fsdp_config, reshard_after_forward=True)
             register_fsdp_forward_method(m.backbone, "get_intermediate_layers")
 
     # 4/ Move to `cuda` device
