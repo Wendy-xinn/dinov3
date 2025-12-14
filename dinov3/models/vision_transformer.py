@@ -1,3 +1,4 @@
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This software may be used and distributed in accordance with
@@ -187,16 +188,21 @@ class DinoVisionTransformer(nn.Module):
         nn.init.zeros_(self.mask_token)
         named_apply(init_weights_vit, self)
 
-    def prepare_tokens_with_masks(self, x: Tensor, masks=None) -> Tuple[Tensor, Tuple[int]]:
+    def prepare_tokens_with_masks(self, x: Tensor, masks=None, imu_tokens: Optional[Tensor] = None) -> Tuple[Tensor, Tuple[int]]:
+        """
+        Prepare token sequence. If imu_tokens is provided, they will be inserted after storage tokens
+        and before patch tokens. imu_tokens expected shape: (B, num_imu_tokens, embed_dim)
+        """
         x = self.patch_embed(x)
         B, H, W, _ = x.shape
-        x = x.flatten(1, 2)
+        x = x.flatten(1, 2)  # (B, N_patches, D)
 
         if masks is not None:
             x = torch.where(masks.unsqueeze(-1), self.mask_token.to(x.dtype).unsqueeze(0), x)
             cls_token = self.cls_token
         else:
             cls_token = self.cls_token + 0 * self.mask_token
+
         if self.n_storage_tokens > 0:
             storage_tokens = self.storage_tokens
         else:
@@ -208,51 +214,111 @@ class DinoVisionTransformer(nn.Module):
                 device=cls_token.device,
             )
 
-        x = torch.cat(
-            [
-                cls_token.expand(B, -1, -1),
-                storage_tokens.expand(B, -1, -1),
-                x,
-            ],
-            dim=1,
-        )
+        # Default ordering: [CLS] [storage] [patches]
+        # If imu_tokens provided, insert them after storage tokens and before patches:
+        if imu_tokens is not None:
+            # ensure dtype/device match and correct batch shape
+            imu_tokens = imu_tokens.to(cls_token.dtype)
+            # concatenate: cls, storage, imu_tokens, patches
+            x = torch.cat(
+                [
+                    cls_token.expand(B, -1, -1),
+                    storage_tokens.expand(B, -1, -1),
+                    imu_tokens,
+                    x,
+                ],
+                dim=1,
+            )
+        else:
+            x = torch.cat(
+                [
+                    cls_token.expand(B, -1, -1),
+                    storage_tokens.expand(B, -1, -1),
+                    x,
+                ],
+                dim=1,
+            )
 
         return x, (H, W)
 
-    def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor]) -> List[Dict[str, Tensor]]:
+    def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor], imu_list: Optional[List[Tensor]] = None) -> List[Dict[str, Tensor]]:
+        """
+        Forward features for multiple crops. imu_list should be aligned with x_list (same length) or None.
+        Returns list of dicts containing keys:
+            - x_norm_clstoken
+            - x_storage_tokens
+            - x_imu_tokens   # NEW: may be empty tensor if no imu
+            - x_norm_patchtokens
+            - x_prenorm
+            - masks
+        """
         x = []
         rope = []
-        for t_x, t_masks in zip(x_list, masks_list):
-            t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks)
+        imu_lens = []  # remember how many imu tokens were inserted for each entry
+        for i, (t_x, t_masks) in enumerate(zip(x_list, masks_list)):
+            imu_tokens = None
+            if imu_list is not None:
+                # imu_list may be a list aligned with x_list, or None per entry
+                imu_tokens = imu_list[i]
+                if imu_tokens is not None:
+                    # sanity check: batch dim must match
+                    assert imu_tokens.shape[0] == t_x.shape[0], "imu batch size must match image batch size"
+                    imu_len = imu_tokens.shape[1]
+                else:
+                    imu_len = 0
+            else:
+                imu_len = 0
+
+            imu_lens.append(imu_len)
+
+            t2_x, hw_tuple = self.prepare_tokens_with_masks(t_x, t_masks, imu_tokens=imu_tokens)
             x.append(t2_x)
             rope.append(hw_tuple)
+
         for _, blk in enumerate(self.blocks):
             if self.rope_embed is not None:
                 rope_sincos = [self.rope_embed(H=H, W=W) for H, W in rope]
             else:
                 rope_sincos = [None for r in rope]
             x = blk(x, rope_sincos)
+
         all_x = x
         output = []
         for idx, (x, masks) in enumerate(zip(all_x, masks_list)):
+            imu_len = imu_lens[idx]
+            # compute norms and split tokens taking imu_len into account
             if self.untie_cls_and_patch_norms or self.untie_global_and_local_cls_norm:
                 if self.untie_global_and_local_cls_norm and self.training and idx == 1:
-                    # Assume second entry of list corresponds to local crops.
-                    # We only ever apply this during training.
                     x_norm_cls_reg = self.local_cls_norm(x[:, : self.n_storage_tokens + 1])
                 elif self.untie_cls_and_patch_norms:
                     x_norm_cls_reg = self.cls_norm(x[:, : self.n_storage_tokens + 1])
                 else:
                     x_norm_cls_reg = self.norm(x[:, : self.n_storage_tokens + 1])
-                x_norm_patch = self.norm(x[:, self.n_storage_tokens + 1 :])
+                # patch tokens start after cls + storage + imu_len
+                x_norm_patch = self.norm(x[:, self.n_storage_tokens + 1 + imu_len :])
             else:
                 x_norm = self.norm(x)
                 x_norm_cls_reg = x_norm[:, : self.n_storage_tokens + 1]
-                x_norm_patch = x_norm[:, self.n_storage_tokens + 1 :]
+                # imu tokens are between cls/storage and patches
+                x_norm_imu = x_norm[:, self.n_storage_tokens + 1 : self.n_storage_tokens + 1 + imu_len] if imu_len > 0 else torch.empty(
+                    x.shape[0], 0, x.shape[2], dtype=x.dtype, device=x.device
+                )
+                x_norm_patch = x_norm[:, self.n_storage_tokens + 1 + imu_len :]
+
+            # Build output dict; always include x_imu_tokens key (may be empty)
+            # If earlier branch used untied norms, we didn't compute x_norm_imu above; compute it now from x (prenorm)
+            if self.untie_cls_and_patch_norms or self.untie_global_and_local_cls_norm:
+                # need to compute x_norm (full norm) to slice imu tokens
+                x_norm_full = self.norm(x)
+                x_norm_imu = x_norm_full[:, self.n_storage_tokens + 1 : self.n_storage_tokens + 1 + imu_len] if imu_len > 0 else torch.empty(
+                    x.shape[0], 0, x.shape[2], dtype=x.dtype, device=x.device
+                )
+
             output.append(
                 {
                     "x_norm_clstoken": x_norm_cls_reg[:, 0],
                     "x_storage_tokens": x_norm_cls_reg[:, 1:],
+                    "x_imu_tokens": x_norm_imu,  # NEW: inserted imu token outputs
                     "x_norm_patchtokens": x_norm_patch,
                     "x_prenorm": x,
                     "masks": masks,
@@ -260,14 +326,32 @@ class DinoVisionTransformer(nn.Module):
             )
         return output
 
-    def forward_features(self, x: Tensor | List[Tensor], masks: Optional[Tensor] = None) -> List[Dict[str, Tensor]]:
+    def forward_features(self, x: Tensor | List[Tensor], masks: Optional[Tensor] = None, imu: Optional[Tensor] = None) -> List[Dict[str, Tensor]]:
+        """
+        Accepts:
+            x: Tensor (B,C,H,W) or list of tensors (multi-crop)
+            masks: optional
+            imu: if x is a Tensor -> imu is Tensor (B, M, D)
+                 if x is list -> imu should be list aligned with x_list
+        """
         if isinstance(x, torch.Tensor):
-            return self.forward_features_list([x], [masks])[0]
+            # single image case
+            if imu is None:
+                imu_list = [None]
+            else:
+                imu_list = [imu]
+            return self.forward_features_list([x], [masks], imu_list=imu_list)[0]
         else:
-            return self.forward_features_list(x, masks)
+            # x is a list of crops
+            if imu is None:
+                imu_list = None
+            else:
+                # expect imu to be a list aligned with x list
+                imu_list = imu
+            return self.forward_features_list(x, masks, imu_list=imu_list)
 
-    def _get_intermediate_layers_not_chunked(self, x: Tensor, n: int = 1) -> List[Tensor]:
-        x, (H, W) = self.prepare_tokens_with_masks(x)
+    def _get_intermediate_layers_not_chunked(self, x: Tensor, n: int = 1, imu_tokens: Optional[Tensor] = None) -> List[Tensor]:
+        x, (H, W) = self.prepare_tokens_with_masks(x, imu_tokens=imu_tokens)
         # If n is an int, take the n last blocks. If it's a list, take them
         output, total_block_len = [], len(self.blocks)
         blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
@@ -286,13 +370,14 @@ class DinoVisionTransformer(nn.Module):
         self,
         x: torch.Tensor,
         *,
-        n: Union[int, Sequence] = 1,  # Layers or n last layers to take
+        n: Union[int, Sequence] = 1,
         reshape: bool = False,
         return_class_token: bool = False,
         return_extra_tokens: bool = False,
         norm: bool = True,
+        imu_tokens: Optional[Tensor] = None,
     ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, ...]]]:
-        outputs = self._get_intermediate_layers_not_chunked(x, n)
+        outputs = self._get_intermediate_layers_not_chunked(x, n, imu_tokens=imu_tokens)
         if norm:
             outputs_normed = []
             for out in outputs:
@@ -305,13 +390,23 @@ class DinoVisionTransformer(nn.Module):
             outputs = outputs_normed
         class_tokens = [out[:, 0] for out in outputs]
         extra_tokens = [out[:, 1 : self.n_storage_tokens + 1] for out in outputs]
-        outputs = [out[:, self.n_storage_tokens + 1 :] for out in outputs]
+        if imu_tokens is not None:
+            imu_len = imu_tokens.shape[1]
+        else:
+            imu_len = 0
+        prefix_len = 1 + self.n_storage_tokens + imu_len
+        patch_outputs = [out[:, prefix_len:, :] for out in outputs]
         if reshape:
             B, _, h, w = x.shape
-            outputs = [
-                out.reshape(B, h // self.patch_size, w // self.patch_size, -1).permute(0, 3, 1, 2).contiguous()
-                for out in outputs
+            H_p = h // self.patch_size
+            W_p = w // self.patch_size
+            patch_outputs = [
+                out.reshape(B, H_p, W_p, -1)
+                .permute(0, 3, 1, 2)
+                .contiguous()
+                for out in patch_outputs
             ]
+        outputs = patch_outputs
         if not return_class_token and not return_extra_tokens:
             return tuple(outputs)
         elif return_class_token and not return_extra_tokens:
